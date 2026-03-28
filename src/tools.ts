@@ -1,3 +1,10 @@
+export async function updateAppointmentInfo(
+  args: Record<string, unknown>
+): Promise<string> {
+  console.log("[Tool] update_appointment_info", args);
+  return "Information recorded.";
+}
+
 // Mock availability slots — Phase 6 will replace with real DB queries
 export async function checkAvailability(date: string): Promise<string> {
   console.log(`[Tool] check_availability for ${date}`);
@@ -31,6 +38,8 @@ export async function executeTool(
   args: Record<string, unknown>
 ): Promise<string> {
   switch (name) {
+    case "update_appointment_info":
+      return updateAppointmentInfo(args);
     case "check_availability":
       return checkAvailability(String(args.date));
     case "book_appointment":
