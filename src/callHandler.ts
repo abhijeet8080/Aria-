@@ -7,6 +7,8 @@ import {
   isBookingComplete,
 } from "./stateMachine";
 import { CallConversation } from "./conversation";
+import { CallLog } from "./db/callLog";
+import { deleteSession } from "./db/redis";
 import { executeTool } from "./tools";
 import { chunkMulawForTwilio, textToMulaw } from "./tts";
 
@@ -37,14 +39,24 @@ export class CallHandler {
   private pendingMarkCount = 0; // track how many marks are in-flight
 
   private markResolvers = new Map<string, () => void>();
+  private readonly callLog: CallLog;
+  private readonly callSid: string;
 
-  constructor(callerPhone: string, streamSid: string, ws: WSContext) {
+  constructor(
+    callerPhone: string,
+    streamSid: string,
+    callSid: string,
+    ws: WSContext
+  ) {
     this.session = createSession(callerPhone, streamSid);
     this.conversation = new CallConversation();
     this.ws = ws;
+    this.callSid = callSid;
+    this.callLog = new CallLog(callSid, callerPhone);
   }
 
   async onCallStart(): Promise<void> {
+    await this.callLog.save();
     this.session.isBusy = true;
     try {
       const text = await this.askGemini(
@@ -76,6 +88,7 @@ export class CallHandler {
     this.session.lastActivityAt = Date.now();
     this.session.interruptRequested = false;
     this.session.isBusy = true; // covers entire Gemini+TTS pipeline
+    this.callLog.addCallerLine(text);
 
     try {
       console.log(`[State: ${this.session.state}] Final: "${text}"`);
@@ -88,6 +101,8 @@ export class CallHandler {
 
   onCallEnd(): void {
     this.clearSilenceTimer();
+    void this.callLog.close(this.session.state).catch(console.error);
+    void deleteSession(this.callSid).catch(console.error);
     console.log(`[CallHandler] Call ended in state: ${this.session.state}`);
   }
 
@@ -154,7 +169,11 @@ export class CallHandler {
     name: string,
     args: Record<string, unknown>
   ): Promise<void> {
-    const result = await executeTool(name, args);
+    const toolArgs =
+      name === "book_appointment"
+        ? { ...args, caller_phone: this.session.callerPhone }
+        : args;
+    const result = await executeTool(name, toolArgs);
 
     if (name === "update_appointment_info") {
       this.session.appointment = {
@@ -217,6 +236,9 @@ export class CallHandler {
   }
 
   private speak(text: string): Promise<void> {
+    if (text.trim()) {
+      this.callLog.addAgentLine(text);
+    }
     this.speakQueue = this.speakQueue
       .then(() => this.doSpeak(text))
       .catch((err) => {

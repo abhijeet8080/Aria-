@@ -59,13 +59,14 @@ app.get(
           case "start": {
             const streamSid =
               msg.streamSid ?? msg.start?.streamSid ?? "";
+            const callSid = msg.start?.callSid ?? streamSid;
             const callerPhone =
-              msg.start?.customParameters?.caller ??
-              msg.start?.callSid ??
-              "unknown";
-            console.log(`[Server] Stream started — caller: ${callerPhone}`);
+              msg.start?.customParameters?.caller ?? "unknown";
+            console.log(
+              `[Server] Stream started — callSid: ${callSid}, caller: ${callerPhone}`
+            );
 
-            handler = new CallHandler(callerPhone, streamSid, ws);
+            handler = new CallHandler(callerPhone, streamSid, callSid, ws);
 
             try {
               deepgramConn = createDeepgramConnection(
