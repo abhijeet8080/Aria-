@@ -41,6 +41,16 @@ export async function textToMulaw(text: string): Promise<Buffer> {
   return raw;
 }
 
+/** Warms HTTP/TLS to Deepgram TTS so the first real utterance is faster. */
+export async function prewarmTTS(): Promise<void> {
+  try {
+    await textToMulaw("Hi.");
+    console.log("[TTS] Connection pre-warmed");
+  } catch {
+    // Best-effort only
+  }
+}
+
 /** Split µ-law audio into 160-byte (20 ms) frames for Twilio outbound media. */
 export function chunkMulawForTwilio(mulaw: Buffer): Buffer[] {
   if (mulaw.length === 0) return [];

@@ -5,6 +5,7 @@ import { serve } from "@hono/node-server";
 import { createDeepgramConnection } from "./deepgram";
 import { decodeTwilioAudio } from "./audio";
 import { CallHandler } from "./callHandler";
+import { prewarmTTS } from "./tts";
 
 const app = new Hono();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
@@ -30,6 +31,7 @@ app.get(
     return {
       onOpen() {
         console.log("[Server] Twilio WebSocket opened");
+        void prewarmTTS();
       },
 
       async onMessage(event, ws) {

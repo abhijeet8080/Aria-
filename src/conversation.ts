@@ -2,7 +2,9 @@ import {
   ChatSession,
   GoogleGenerativeAI,
   SchemaType,
+  type Content,
   type FunctionDeclaration,
+  FunctionCallingMode,
   type Tool,
 } from "@google/generative-ai";
 import {
@@ -10,6 +12,8 @@ import {
   formatAppointmentSummary,
   missingFields,
 } from "./stateMachine";
+import { isAffirmative } from "./intent";
+import { extractCompleteSentences } from "./sentenceSplitter";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
@@ -93,7 +97,8 @@ Rules:
 - Never ask more than one question at a time
 - Today's date is ${new Date().toISOString().split("T")[0]}
 - Clinic hours: Mon–Fri 9am–5pm. Address: 123 Health Street, Bangalore
-- Only discuss clinic-related topics`;
+- Only discuss clinic-related topics
+- CRITICAL: Never tell the caller the appointment is "confirmed", "booked", "all set", "scheduled", or "on the books" until the book_appointment tool has been called and returned success in this conversation. Do not imply a completed booking with plain text alone.`;
 
 function stateInstruction(session: CallSession): string {
   switch (session.state) {
@@ -112,7 +117,7 @@ Ask for the next missing field only. Use update_appointment_info when the caller
     case "CONFIRMING":
       return `State: CONFIRMING.
 Read back the full booking: ${formatAppointmentSummary(session.appointment)}.
-Ask the caller to confirm. If they confirm, call book_appointment. If they want to change something, say which field to correct.`;
+Ask the caller to confirm. If they clearly confirm (yes / correct / sounds good), you MUST call book_appointment with the details above — do not describe the booking as confirmed in text only. If they want to change something, help them correct the field and do not call book_appointment until they confirm again.`;
 
     case "BOOKED":
       return `State: BOOKED. The appointment is confirmed. Call send_confirmation_sms, then say a warm goodbye.`;
@@ -123,16 +128,17 @@ Ask the caller to confirm. If they confirm, call book_appointment. If they want 
 }
 
 export class CallConversation {
-  private readonly chat: ChatSession;
+  private readonly model: ReturnType<GoogleGenerativeAI["getGenerativeModel"]>;
+  private chat: ChatSession;
 
   constructor() {
-    const model = genAI.getGenerativeModel({
+    this.model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash",
       systemInstruction: BASE_SYSTEM_PROMPT,
       tools,
     });
 
-    this.chat = model.startChat({ history: [] });
+    this.chat = this.model.startChat({ history: [] });
   }
 
   async sendMessage(
@@ -145,6 +151,150 @@ export class CallConversation {
     const fullMessage = `[${stateInstruction(session)}]\nCaller said: "${userText}"`;
     console.log(`[Gemini ←] ${userText} (state: ${session.state})`);
 
+    if (session.state === "CONFIRMING" && isAffirmative(userText)) {
+      const forced = await this.sendConfirmingAffirmative(fullMessage);
+      if (forced !== null) {
+        return forced;
+      }
+    }
+
+    return this.sendMessageNormal(fullMessage);
+  }
+
+  /**
+   * Streaming generation: invokes `onSentence` for each complete sentence as tokens arrive.
+   * Used for lower latency on non-CONFIRMING turns. Stops TTS when a tool call is detected.
+   */
+  async sendMessageStream(
+    userText: string,
+    session: CallSession,
+    onSentence: (sentence: string) => void
+  ): Promise<{
+    toolCall?: { name: string; args: Record<string, unknown> };
+  }> {
+    const fullMessage = `[${stateInstruction(session)}]\nCaller said: "${userText}"`;
+    console.log(`[Gemini ←] ${userText} (state: ${session.state}) [stream]`);
+
+    const streamResult = await this.chat.sendMessageStream(fullMessage);
+    let toolCall: { name: string; args: Record<string, unknown> } | undefined;
+    let buffer = "";
+
+    try {
+      for await (const chunk of streamResult.stream) {
+        let fnCalls: ReturnType<typeof chunk.functionCalls> | undefined;
+        try {
+          fnCalls = chunk.functionCalls();
+        } catch {
+          fnCalls = undefined;
+        }
+        if (fnCalls && fnCalls.length > 0) {
+          const fc = fnCalls[0];
+          toolCall = {
+            name: fc.name,
+            args: (fc.args ?? {}) as Record<string, unknown>,
+          };
+          buffer = "";
+          console.log(`[Gemini tool] ${toolCall.name}`, toolCall.args);
+          continue;
+        }
+
+        let token = "";
+        try {
+          token = chunk.text();
+        } catch {
+          continue;
+        }
+        if (!token) continue;
+
+        buffer += token;
+
+        const { flushed, remainder } = extractCompleteSentences(buffer);
+        if (flushed) {
+          console.log(`[Gemini stream] sentence: "${flushed.slice(0, 80)}${flushed.length > 80 ? "…" : ""}"`);
+          onSentence(flushed);
+          buffer = remainder;
+        }
+      }
+
+      await streamResult.response;
+
+      const tail = buffer.trim();
+      if (tail && !toolCall) {
+        console.log(`[Gemini stream] final: "${tail.slice(0, 80)}${tail.length > 80 ? "…" : ""}"`);
+        onSentence(tail);
+      }
+    } catch (e) {
+      console.error("[Gemini] sendMessageStream failed:", e);
+      throw e;
+    }
+
+    return toolCall ? { toolCall } : {};
+  }
+
+  /**
+   * Layer 2: force book_appointment when the caller affirms in CONFIRMING.
+   * Falls back to null so normal chat path runs (then Layer 1 in CallHandler can book).
+   */
+  private async sendConfirmingAffirmative(fullMessage: string): Promise<{
+    text: string;
+    toolCall?: { name: string; args: Record<string, unknown> };
+  } | null> {
+    try {
+      const history = await this.chat.getHistory();
+      const newUser: Content = { role: "user", parts: [{ text: fullMessage }] };
+
+      const result = await this.model.generateContent({
+        contents: [...history, newUser],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: FunctionCallingMode.ANY,
+            allowedFunctionNames: ["book_appointment"],
+          },
+        },
+      });
+
+      const response = result.response;
+      const functionCall = response.functionCalls()?.[0];
+      const candidate = response.candidates?.[0];
+      const modelContent = candidate?.content;
+
+      if (modelContent) {
+        const contentWithRole: Content = {
+          ...modelContent,
+          role: modelContent.role || "model",
+        };
+        this.chat = this.model.startChat({
+          history: [...history, newUser, contentWithRole],
+        });
+      }
+
+      if (functionCall) {
+        console.log(`[Gemini tool] ${functionCall.name}`, functionCall.args);
+        return {
+          text: "",
+          toolCall: {
+            name: functionCall.name,
+            args: functionCall.args as Record<string, unknown>,
+          },
+        };
+      }
+
+      const text = response.text();
+      console.log(`[Gemini →] ${text}`);
+      return { text };
+    } catch (e) {
+      console.warn(
+        "[Gemini] CONFIRMING forced tool call failed, using normal chat:",
+        e
+      );
+      return null;
+    }
+  }
+
+  private async sendMessageNormal(fullMessage: string): Promise<{
+    text: string;
+    toolCall?: { name: string; args: Record<string, unknown> };
+  }> {
     const result = await this.chat.sendMessage(fullMessage);
     const response = result.response;
 

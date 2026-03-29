@@ -11,6 +11,7 @@ import { CallLog } from "./db/callLog";
 import { deleteSession } from "./db/redis";
 import { executeTool } from "./tools";
 import { chunkMulawForTwilio, textToMulaw } from "./tts";
+import { impliesPrematureBookingClaim, isAffirmative } from "./intent";
 
 const SILENCE_TIMEOUT_MS = 4000;
 const MAX_NO_MATCH = 3;
@@ -31,6 +32,9 @@ export class CallHandler {
   private readonly conversation: CallConversation;
   private readonly ws: WSContext;
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private transcriptQueue: Promise<void> = Promise.resolve();
+  private isClosed = false;
 
   // ── Speak queue ──────────────────────────────────────────────────────────
   // Ensures only one TTS response plays at a time.
@@ -82,6 +86,7 @@ export class CallHandler {
   }
 
   async onFinalTranscript(text: string): Promise<void> {
+    if (this.isClosed) return;
     if (!text.trim()) return;
 
     this.clearSilenceTimer();
@@ -90,17 +95,35 @@ export class CallHandler {
     this.session.isBusy = true; // covers entire Gemini+TTS pipeline
     this.callLog.addCallerLine(text);
 
-    try {
-      console.log(`[State: ${this.session.state}] Final: "${text}"`);
-      await this.processTranscript(text);
-    } finally {
+    this.transcriptQueue = this.transcriptQueue.then(async () => {
+      if (this.isClosed) return;
+      try {
+        console.log(`[State: ${this.session.state}] Final: "${text}"`);
+        await this.processTranscript(text);
+      } finally {
+        this.session.isBusy = false;
+        // Silence timer starts only via onMark() after the last audio chunk plays
+      }
+    }).catch((err) => {
+      console.error("[Transcript queue error]", err);
       this.session.isBusy = false;
-      // Silence timer starts only via onMark() after the last audio chunk plays
-    }
+    });
   }
 
   onCallEnd(): void {
+    this.isClosed = true;
     this.clearSilenceTimer();
+
+    if (
+      this.session.state === "CONFIRMING" &&
+      isBookingComplete(this.session.appointment)
+    ) {
+      console.error(
+        "[CRITICAL] Call ended in CONFIRMING with a complete appointment — booking may have been missed.",
+        { callSid: this.callSid, appointment: this.session.appointment }
+      );
+    }
+
     void this.callLog.close(this.session.state).catch(console.error);
     void deleteSession(this.callSid).catch(console.error);
     console.log(`[CallHandler] Call ended in state: ${this.session.state}`);
@@ -138,12 +161,39 @@ export class CallHandler {
   }
 
   private async processTranscript(text: string): Promise<void> {
+    if (this.session.state === "CONFIRMING") {
+      await this.handleConfirmingTranscript(text);
+      return;
+    }
+    await this.processTranscriptStreaming(text);
+  }
+
+  /** Non-streaming: forced tool modes + Layer 1 booking safety net. */
+  private async handleConfirmingTranscript(text: string): Promise<void> {
     const { text: responseText, toolCall } =
       await this.conversation.sendMessage(text, this.session);
 
     if (toolCall) {
-      // Tool call — only speak after tool resolves inside handleToolCall
       await this.handleToolCall(toolCall.name, toolCall.args);
+      return;
+    }
+
+    if (
+      this.session.state === "CONFIRMING" &&
+      isBookingComplete(this.session.appointment) &&
+      (isAffirmative(text) || impliesPrematureBookingClaim(responseText))
+    ) {
+      console.log(
+        "[Booking] Layer 1: forcing book_appointment (affirmative or premature booking claim in text)"
+      );
+      await this.handleToolCall("book_appointment", {
+        name: this.session.appointment.name!,
+        date: this.session.appointment.date!,
+        time: this.session.appointment.time!,
+        ...(this.session.appointment.reason
+          ? { reason: this.session.appointment.reason }
+          : {}),
+      });
       return;
     }
 
@@ -157,12 +207,88 @@ export class CallHandler {
 
     this.session.noMatchCount = 0;
 
+    await this.speak(responseText);
+  }
+
+  /** Gemini streaming + sentence TTS pipeline (parallel fetches, serial playback). */
+  private async processTranscriptStreaming(text: string): Promise<void> {
+    let sawText = false;
+
+    const { toolCall } = await this.conversation.sendMessageStream(
+      text,
+      this.session,
+      (sentence) => {
+        sawText = true;
+        console.log(`[Pipeline] TTS queued for: "${sentence.slice(0, 60)}${sentence.length > 60 ? "…" : ""}"`);
+        const ttsPromise = textToMulaw(sentence);
+        this.speakFromMulawPromise(ttsPromise, sentence);
+      }
+    );
+
+    if (toolCall) {
+      await this.handleToolCall(toolCall.name, toolCall.args);
+      return;
+    }
+
+    if (!sawText) {
+      this.session.noMatchCount++;
+      if (this.session.noMatchCount >= MAX_NO_MATCH) {
+        await this.transitionTo("FAILED");
+      }
+      return;
+    }
+
+    this.session.noMatchCount = 0;
+
     if (this.session.state === "GREETING") {
       this.session.state = "COLLECTING_INFO";
       console.log("[State] GREETING → COLLECTING_INFO");
     }
+  }
 
-    await this.speak(responseText);
+  /** Queue playback of µ-law audio once the TTS fetch resolves (overlaps with next Gemini tokens). */
+  private speakFromMulawPromise(
+    ttsPromise: Promise<Buffer>,
+    sentenceForLog: string
+  ): void {
+    if (sentenceForLog.trim()) {
+      this.callLog.addAgentLine(sentenceForLog.trim());
+    }
+    this.speakQueue = this.speakQueue
+      .then(async () => {
+        if (this.isClosed) return;
+        if (this.session.interruptRequested) {
+          console.log("[Speak] Skipping — barge-in requested");
+          return;
+        }
+        let mulawBuffer: Buffer;
+        try {
+          mulawBuffer = await ttsPromise;
+        } catch (err) {
+          console.error("[TTS] Fetch failed:", err);
+          return;
+        }
+        if (mulawBuffer.length === 0) return;
+
+        if (this.session.interruptRequested) {
+          console.log("[Speak] Skipping — barge-in requested");
+          return;
+        }
+
+        this.session.isSpeaking = true;
+        this.session.interruptRequested = false;
+        this.clearSilenceTimer();
+
+        try {
+          await this.doPlayBuffer(mulawBuffer);
+        } catch (err) {
+          console.error("[TTS] Playback error:", err);
+          this.session.isSpeaking = false;
+        }
+      })
+      .catch((err) => {
+        console.error("[Speak queue]", err);
+      });
   }
 
   private async handleToolCall(
@@ -176,9 +302,13 @@ export class CallHandler {
     const result = await executeTool(name, toolArgs);
 
     if (name === "update_appointment_info") {
+      const mergedArgs = mergeAppointmentArgs(args);
+      if (mergedArgs.reason && this.session.appointment.reason && mergedArgs.reason !== this.session.appointment.reason) {
+        mergedArgs.reason = `${this.session.appointment.reason} ${mergedArgs.reason}`;
+      }
       this.session.appointment = {
         ...this.session.appointment,
-        ...mergeAppointmentArgs(args),
+        ...mergedArgs,
       };
       console.log("[Session] Appointment updated:", this.session.appointment);
 
@@ -240,7 +370,10 @@ export class CallHandler {
       this.callLog.addAgentLine(text);
     }
     this.speakQueue = this.speakQueue
-      .then(() => this.doSpeak(text))
+      .then(() => {
+        if (this.isClosed) return;
+        return this.doSpeak(text);
+      })
       .catch((err) => {
         console.error("[Speak queue]", err);
       });
@@ -261,6 +394,15 @@ export class CallHandler {
 
     try {
       const mulawBuffer = await textToMulaw(text);
+      await this.doPlayBuffer(mulawBuffer);
+    } catch (err) {
+      console.error("[TTS] Error:", err);
+      this.session.isSpeaking = false;
+    }
+  }
+
+  private async doPlayBuffer(mulawBuffer: Buffer): Promise<void> {
+    try {
       const chunks = chunkMulawForTwilio(mulawBuffer);
 
       for (const chunk of chunks) {
