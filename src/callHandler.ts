@@ -76,13 +76,14 @@ export class CallHandler {
     if (text.trim().length > 0) {
       this.clearSilenceTimer(); // caller is speaking, cancel any pending reprompt
       this.session.lastActivityAt = Date.now();
-
-      if (this.session.isSpeaking) {
-        console.log("[Barge-in] Detected — stopping TTS playback");
-        this.session.interruptRequested = true;
-        this.sendClearAudio();
-      }
     }
+  }
+
+  public handleBargeIn(): void {
+    if (this.isClosed || !this.session.isSpeaking) return;
+    console.log("[Barge-in] Detected locally via VAD — stopping TTS playback");
+    this.session.interruptRequested = true;
+    this.sendClearAudio();
   }
 
   async onFinalTranscript(text: string): Promise<void> {

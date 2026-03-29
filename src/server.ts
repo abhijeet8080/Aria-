@@ -6,6 +6,7 @@ import { createDeepgramConnection } from "./deepgram";
 import { decodeTwilioAudio } from "./audio";
 import { CallHandler } from "./callHandler";
 import { prewarmTTS } from "./tts";
+import { RealTimeVAD } from "@ericedouard/vad-node-realtime";
 
 const app = new Hono();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
@@ -27,6 +28,7 @@ app.get(
   upgradeWebSocket((c) => {
     let handler: CallHandler | null = null;
     let deepgramConn: ReturnType<typeof createDeepgramConnection> | null = null;
+    let vadInstance: any = null;
 
     return {
       onOpen() {
@@ -69,6 +71,16 @@ app.get(
             );
 
             handler = new CallHandler(callerPhone, streamSid, callSid, ws);
+            RealTimeVAD.new({
+              onSpeechStart: () => {
+                handler?.handleBargeIn();
+              }
+            })
+              .then((v: any) => {
+                vadInstance = v;
+                vadInstance.start();
+              })
+              .catch(console.error);
 
             try {
               deepgramConn = createDeepgramConnection(
@@ -95,7 +107,22 @@ app.get(
 
           case "media":
             if (!deepgramConn || !msg.media?.payload) return;
-            deepgramConn.safeSend(decodeTwilioAudio(msg.media.payload));
+            const pcmBuffer = decodeTwilioAudio(msg.media.payload);
+            deepgramConn.safeSend(pcmBuffer);
+
+            if (vadInstance) {
+              const float32Array = new Float32Array(pcmBuffer.length);
+              for (let i = 0; i < pcmBuffer.length / 2; i++) {
+                const sample = pcmBuffer.readInt16LE(i * 2) / 32768.0;
+                float32Array[i * 2] = sample;
+                float32Array[i * 2 + 1] = sample;
+              }
+              try {
+                vadInstance.processAudio(float32Array);
+              } catch (e) {
+                console.error("[VAD Error]", e);
+              }
+            }
             break;
 
           case "mark":
@@ -111,6 +138,10 @@ app.get(
             deepgramConn?.safeFinish();
             handler = null;
             deepgramConn = null;
+            if (vadInstance) {
+              vadInstance.destroy();
+            }
+            vadInstance = null;
             break;
 
           default:
