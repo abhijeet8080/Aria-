@@ -17,7 +17,7 @@ import { extractCompleteSentences } from "./sentenceSplitter";
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
-const tools: Tool[] = [
+export const tools: Tool[] = [
   {
     functionDeclarations: [
       {
@@ -91,7 +91,7 @@ const tools: Tool[] = [
   },
 ];
 
-const BASE_SYSTEM_PROMPT = `You are a friendly AI receptionist for a medical clinic.
+export const BASE_SYSTEM_PROMPT = `You are a friendly AI receptionist for a medical clinic.
 Rules:
 - Keep every response under 2 sentences — this is a phone call
 - Never ask more than one question at a time

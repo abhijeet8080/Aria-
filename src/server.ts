@@ -4,9 +4,12 @@ import { createNodeWebSocket } from "@hono/node-ws";
 import { serve } from "@hono/node-server";
 import { createDeepgramConnection } from "./deepgram";
 import { decodeTwilioAudio } from "./audio";
-import { CallHandler } from "./callHandler";
+// import { CallHandler } from "./SequentialCallHandler";
 import { prewarmTTS } from "./tts";
 import { RealTimeVAD } from "@ericedouard/vad-node-realtime";
+
+// Uncomment the line below to switch to the native Audio-to-Audio Live API handler
+import { CallHandler } from "./LiveCallHandler";
 
 const app = new Hono();
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
@@ -82,33 +85,43 @@ app.get(
               })
               .catch(console.error);
 
-            try {
-              deepgramConn = createDeepgramConnection(
-                (text, isFinal) => {
-                  if (!handler) return;
-                  if (!isFinal) {
-                    process.stdout.write(`\r[interim] ${text}   `);
-                    void handler.onInterimTranscript(text);
-                  } else {
-                    console.log(`\n[FINAL]   ${text}`);
-                    void handler.onFinalTranscript(text);
-                  }
-                },
-                { sampleRate: 8000 }
-              );
-              setTimeout(() => {
-                void handler?.onCallStart();
-              }, 500);
-            } catch (e) {
-              console.error("[Server] Failed to start Deepgram:", e);
+            if (!(handler as any).isNativeLive) {
+              try {
+                deepgramConn = createDeepgramConnection(
+                  (text, isFinal) => {
+                    if (!handler) return;
+                    if (!isFinal) {
+                      process.stdout.write(`\r[interim] ${text}   `);
+                      void (handler as any).onInterimTranscript?.(text);
+                    } else {
+                      console.log(`\n[FINAL]   ${text}`);
+                      void (handler as any).onFinalTranscript?.(text);
+                    }
+                  },
+                  { sampleRate: 8000 }
+                );
+                setTimeout(() => {
+                  void handler?.onCallStart();
+                }, 500);
+              } catch (e) {
+                console.error("[Server] Failed to start Deepgram:", e);
+              }
+            } else {
+              void handler.onCallStart();
             }
             break;
           }
 
           case "media":
-            if (!deepgramConn || !msg.media?.payload) return;
+            if (!msg.media?.payload) return;
             const pcmBuffer = decodeTwilioAudio(msg.media.payload);
-            deepgramConn.safeSend(pcmBuffer);
+
+            if (deepgramConn) {
+              deepgramConn.safeSend(pcmBuffer);
+            }
+            if (handler && (handler as any).isNativeLive) {
+              (handler as any).receiveAudio(pcmBuffer);
+            }
 
             if (vadInstance) {
               const float32Array = new Float32Array(pcmBuffer.length);
