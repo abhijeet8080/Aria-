@@ -20,7 +20,9 @@ app.get("/twiml", (c) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${wsUrl}" />
+    <Stream url="${wsUrl}">
+      <Parameter name="caller" value="{{From}}" />
+    </Stream>
   </Connect>
 </Response>`;
   return c.text(twiml, 200, { "Content-Type": "text/xml" });
@@ -88,8 +90,11 @@ app.get(
             if (!(handler as any).isNativeLive) {
               try {
                 deepgramConn = createDeepgramConnection(
-                  (text, isFinal) => {
+                  (text, isFinal, detectedLanguage) => {
                     if (!handler) return;
+                    if (detectedLanguage) {
+                      (handler as any).updateLanguage?.(detectedLanguage);
+                    }
                     if (!isFinal) {
                       process.stdout.write(`\r[interim] ${text}   `);
                       void (handler as any).onInterimTranscript?.(text);
@@ -117,7 +122,10 @@ app.get(
             const pcmBuffer = decodeTwilioAudio(msg.media.payload);
 
             if (deepgramConn) {
-              deepgramConn.safeSend(pcmBuffer);
+              const canAccept = typeof (handler as any)?.isAcceptingAudio === "function"
+                ? (handler as any).isAcceptingAudio()
+                : true;
+              if (canAccept) deepgramConn.safeSend(pcmBuffer);
             }
             if (handler && (handler as any).isNativeLive) {
               (handler as any).receiveAudio(pcmBuffer);

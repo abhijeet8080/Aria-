@@ -98,32 +98,40 @@ Rules:
 - Today's date is ${new Date().toISOString().split("T")[0]}
 - Clinic hours: Mon–Fri 9am–5pm. Address: 123 Health Street, Bangalore
 - Only discuss clinic-related topics
-- CRITICAL: Never tell the caller the appointment is "confirmed", "booked", "all set", "scheduled", or "on the books" until the book_appointment tool has been called and returned success in this conversation. Do not imply a completed booking with plain text alone.`;
+- CRITICAL: Never tell the caller the appointment is "confirmed", "booked", "all set", "scheduled", or "on the books" until the book_appointment tool has been called and returned success in this conversation. Do not imply a completed booking with plain text alone.
+- LANGUAGE: Detect the language the caller speaks and respond entirely in that same language for the rest of the call. If they speak Hindi, respond in Hindi. If they speak Kannada, respond in Kannada. Never switch languages unless the caller does first.`;
 
 function stateInstruction(session: CallSession): string {
+  const langHint = session.language && !session.language.startsWith("en")
+    ? `\nRespond in language: ${session.language}.`
+    : "";
+
   switch (session.state) {
     case "GREETING":
-      return "State: GREETING. Warmly greet the caller and ask how you can help.";
+      return `State: GREETING. You have already greeted the caller. Do not greet again. Just ask how you can help.${langHint}`;
 
     case "COLLECTING_INFO": {
       const missing = missingFields(session.appointment);
       const collected = JSON.stringify(session.appointment);
+      if (missing.length === 0) {
+        return `State: COLLECTING_INFO. All details collected: ${collected}. Read back a brief appointment summary and ask the caller to confirm.${langHint}`;
+      }
       return `State: COLLECTING_INFO.
 Collected so far: ${collected}.
-Still need: ${missing.join(", ") || "(none — use tools to finalize)"}.
-Ask for the next missing field only. Use update_appointment_info when the caller provides any detail.`;
+Still need: ${missing.join(", ")}.
+Ask for the next missing field only. Use update_appointment_info when the caller provides any detail.${langHint}`;
     }
 
     case "CONFIRMING":
       return `State: CONFIRMING.
 Read back the full booking: ${formatAppointmentSummary(session.appointment)}.
-Ask the caller to confirm. If they clearly confirm (yes / correct / sounds good), you MUST call book_appointment with the details above — do not describe the booking as confirmed in text only. If they want to change something, help them correct the field and do not call book_appointment until they confirm again.`;
+Ask the caller to confirm. If they clearly confirm (yes / correct / sounds good), you MUST call book_appointment with the details above — do not describe the booking as confirmed in text only. If they want to change something, help them correct the field and do not call book_appointment until they confirm again.${langHint}`;
 
     case "BOOKED":
-      return `State: BOOKED. The appointment is confirmed. Call send_confirmation_sms, then say a warm goodbye.`;
+      return `State: BOOKED. The appointment is confirmed. Say a warm, brief one-sentence goodbye only.${langHint}`;
 
     case "FAILED":
-      return "State: FAILED. Apologise, offer to transfer to a human, and end the call politely.";
+      return `State: FAILED. Apologise, offer to transfer to a human, and end the call politely.${langHint}`;
   }
 }
 

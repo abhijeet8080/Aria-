@@ -9,12 +9,13 @@ import {
 import { CallConversation } from "./conversation";
 import { CallLog } from "./db/callLog";
 import { deleteSession } from "./db/redis";
-import { executeTool } from "./tools";
+import { executeTool, hangUpCall, sendConfirmationSms } from "./tools";
 import { chunkMulawForTwilio, textToMulaw } from "./tts";
 import { impliesPrematureBookingClaim, isAffirmative } from "./intent";
 
 const SILENCE_TIMEOUT_MS = 4000;
 const MAX_NO_MATCH = 3;
+const POST_SPEAK_COOLDOWN_MS = 300;
 
 function mergeAppointmentArgs(
   args: Record<string, unknown>
@@ -40,7 +41,8 @@ export class CallHandler {
   // Ensures only one TTS response plays at a time.
   // Any new speak() call waits for the current one to fully finish.
   private speakQueue: Promise<void> = Promise.resolve();
-  private pendingMarkCount = 0; // track how many marks are in-flight
+  private pendingMarkCount = 0;
+  private speakEndedAt = 0; // timestamp when last TTS mark was received
 
   private markResolvers = new Map<string, () => void>();
   private readonly callLog: CallLog;
@@ -59,6 +61,13 @@ export class CallHandler {
     this.callLog = new CallLog(callSid, callerPhone);
   }
 
+  /** Returns true if it's safe to forward audio to Deepgram (echo gate). */
+  public isAcceptingAudio(): boolean {
+    if (this.session.isSpeaking) return false;
+    if (this.speakEndedAt > 0 && Date.now() - this.speakEndedAt < POST_SPEAK_COOLDOWN_MS) return false;
+    return true;
+  }
+
   async onCallStart(): Promise<void> {
     await this.callLog.save();
     this.session.isBusy = true;
@@ -74,7 +83,7 @@ export class CallHandler {
 
   async onInterimTranscript(text: string): Promise<void> {
     if (text.trim().length > 0) {
-      this.clearSilenceTimer(); // caller is speaking, cancel any pending reprompt
+      this.clearSilenceTimer();
       this.session.lastActivityAt = Date.now();
     }
   }
@@ -83,6 +92,7 @@ export class CallHandler {
     if (this.isClosed || !this.session.isSpeaking) return;
     console.log("[Barge-in] Detected locally via VAD — stopping TTS playback");
     this.session.interruptRequested = true;
+    this.speakEndedAt = 0;
     this.sendClearAudio();
   }
 
@@ -90,10 +100,16 @@ export class CallHandler {
     if (this.isClosed) return;
     if (!text.trim()) return;
 
+    // Guard: drop transcripts that arrive while AI is speaking (PSTN echo)
+    if (this.session.isSpeaking && !this.session.interruptRequested) return;
+
+    // Drop transcripts in terminal states
+    if (this.session.state === "BOOKED" || this.session.state === "FAILED") return;
+
     this.clearSilenceTimer();
     this.session.lastActivityAt = Date.now();
     this.session.interruptRequested = false;
-    this.session.isBusy = true; // covers entire Gemini+TTS pipeline
+    this.session.isBusy = true;
     this.callLog.addCallerLine(text);
 
     this.transcriptQueue = this.transcriptQueue.then(async () => {
@@ -103,7 +119,6 @@ export class CallHandler {
         await this.processTranscript(text);
       } finally {
         this.session.isBusy = false;
-        // Silence timer starts only via onMark() after the last audio chunk plays
       }
     }).catch((err) => {
       console.error("[Transcript queue error]", err);
@@ -139,9 +154,9 @@ export class CallHandler {
     const resolver = this.markResolvers.get(markName);
     if (resolver) {
       this.markResolvers.delete(markName);
-      resolver(); // unblocks doSpeak() → queue advances
+      resolver();
       this.session.isSpeaking = false;
-      // Only start silence timer when nothing else is processing
+      this.speakEndedAt = Date.now();
       if (!this.session.isBusy) {
         this.resetSilenceTimer();
       }
@@ -207,7 +222,6 @@ export class CallHandler {
     }
 
     this.session.noMatchCount = 0;
-
     await this.speak(responseText);
   }
 
@@ -221,7 +235,7 @@ export class CallHandler {
       (sentence) => {
         sawText = true;
         console.log(`[Pipeline] TTS queued for: "${sentence.slice(0, 60)}${sentence.length > 60 ? "…" : ""}"`);
-        const ttsPromise = textToMulaw(sentence);
+        const ttsPromise = textToMulaw(sentence, this.session.language);
         this.speakFromMulawPromise(ttsPromise, sentence);
       }
     );
@@ -244,6 +258,14 @@ export class CallHandler {
     if (this.session.state === "GREETING") {
       this.session.state = "COLLECTING_INFO";
       console.log("[State] GREETING → COLLECTING_INFO");
+    }
+  }
+
+  /** Called by server.ts when Deepgram detects the caller's language. */
+  public updateLanguage(lang: string): void {
+    if (lang && lang !== this.session.language) {
+      console.log(`[Language] Detected: ${lang} (was: ${this.session.language})`);
+      this.session.language = lang;
     }
   }
 
@@ -321,7 +343,10 @@ export class CallHandler {
       const followUp = await this.conversation.sendToolResult(name, result);
 
       if (isBookingComplete(this.session.appointment)) {
-        await this.transitionTo("CONFIRMING");
+        // Inline CONFIRMING transition — avoid double confirmation message
+        console.log(`[State] ${this.session.state} → CONFIRMING`);
+        this.session.state = "CONFIRMING";
+        if (followUp.trim()) await this.speak(followUp);
         return;
       }
 
@@ -330,9 +355,21 @@ export class CallHandler {
     }
 
     if (name === "book_appointment") {
+      this.session.state = "BOOKED";
+      console.log("[State] → BOOKED");
+
+      // Send confirmation SMS directly (don't rely on Gemini to call the tool)
+      if (this.session.callerPhone && this.session.callerPhone !== "unknown") {
+        const appt = this.session.appointment;
+        const smsMsg = `Your appointment is confirmed! ${appt.name} on ${appt.date} at ${appt.time}${appt.reason ? ` for ${appt.reason}` : ""}. Ref: see confirmation ID in call log.`;
+        void sendConfirmationSms({ phone_number: this.session.callerPhone, message: smsMsg }).catch(console.error);
+      }
+
       const finalText = await this.conversation.sendToolResult(name, result);
       await this.speak(finalText);
-      await this.transitionTo("BOOKED");
+
+      // Hang up after goodbye plays
+      setTimeout(() => void hangUpCall(this.callSid), 2000);
       return;
     }
 
@@ -394,7 +431,7 @@ export class CallHandler {
     this.clearSilenceTimer();
 
     try {
-      const mulawBuffer = await textToMulaw(text);
+      const mulawBuffer = await textToMulaw(text, this.session.language);
       await this.doPlayBuffer(mulawBuffer);
     } catch (err) {
       console.error("[TTS] Error:", err);
@@ -468,6 +505,8 @@ export class CallHandler {
   }
 
   private resetSilenceTimer(): void {
+    // Don't restart silence timer in terminal states
+    if (this.session.state === "BOOKED" || this.session.state === "FAILED") return;
     this.clearSilenceTimer();
     this.silenceTimer = setTimeout(() => {
       void this.onSilenceTimeout();
@@ -475,9 +514,8 @@ export class CallHandler {
   }
 
   private async onSilenceTimeout(): Promise<void> {
-    // Don't fire if we're generating a response OR playing audio
     if (this.session.isBusy || this.session.isSpeaking) {
-      this.resetSilenceTimer(); // reschedule and check again
+      this.resetSilenceTimer();
       return;
     }
     console.log("[Silence] 4s of silence — reprompting");
@@ -485,7 +523,7 @@ export class CallHandler {
   }
 
   private async handleSilenceReprompt(): Promise<void> {
-    if (this.session.isBusy) return; // double-guard
+    if (this.session.isBusy) return;
     this.session.isBusy = true;
     try {
       const text = await this.askGemini(

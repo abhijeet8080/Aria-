@@ -13,7 +13,7 @@ import {
 } from "./stateMachine";
 import { CallLog } from "./db/callLog";
 import { deleteSession } from "./db/redis";
-import { executeTool } from "./tools";
+import { executeTool, hangUpCall, sendConfirmationSms } from "./tools";
 import { tools, BASE_SYSTEM_PROMPT } from "./conversation";
 
 function mergeAppointmentArgs(
@@ -51,6 +51,8 @@ export class CallHandler {
   private geminiWs: WebSocket | null = null;
   private markResolvers = new Map<string, () => void>();
   private pendingMarkCount = 0;
+  private geminiAudioChunks: Buffer[] = [];
+  private pendingHangup = false;
 
   constructor(
     callerPhone: string,
@@ -73,7 +75,7 @@ export class CallHandler {
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
     if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY missing");
 
-    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiWrite?key=${GEMINI_API_KEY}`;
+    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`;
     this.geminiWs = new WebSocket(url);
 
     this.geminiWs.on("open", () => {
@@ -83,16 +85,27 @@ export class CallHandler {
 
     this.geminiWs.on("message", async (data) => {
       if (this.isClosed) return;
+      const raw = data.toString();
+      let msg: any;
       try {
-        const msg = JSON.parse(data.toString());
+        msg = JSON.parse(raw);
+      } catch {
+        console.error("[Gemini Live] Non-JSON message:", raw.slice(0, 300));
+        return;
+      }
+      // Log any server-side error before it closes the socket
+      if (msg.error) {
+        console.error("[Gemini Live] Server error:", JSON.stringify(msg.error));
+      }
+      try {
         await this.handleGeminiMessage(msg);
       } catch (err) {
-        console.error("[Gemini Live] Message parse error", err);
+        console.error("[Gemini Live] Handler error:", err);
       }
     });
 
-    this.geminiWs.on("close", () => {
-      console.log("[Gemini Live] Disconnected");
+    this.geminiWs.on("close", (code, reason) => {
+      console.log(`[Gemini Live] Disconnected — code: ${code}, reason: ${reason?.toString() || "(none)"}`);
     });
 
     this.geminiWs.on("error", (e) => {
@@ -103,12 +116,21 @@ export class CallHandler {
   private getDynamicStateInstruction(): string {
     const missing = missingFields(this.session.appointment);
     const collected = JSON.stringify(this.session.appointment);
-    
-    let statePrompt = `Current State: ${this.session.state}.`;
+    const langNote = this.session.language && !this.session.language.startsWith("en")
+      ? ` Respond in language: ${this.session.language}.`
+      : "";
+
+    let statePrompt = `Current State: ${this.session.state}.${langNote}`;
     if (this.session.state === "COLLECTING_INFO") {
-      statePrompt += `\nCollected so far: ${collected}.\nStill need: ${missing.join(", ") || "(none — use tools to finalize)"}.\nAsk for the next missing field only.`;
+      if (missing.length === 0) {
+        statePrompt += `\nAll details collected: ${collected}. Read back a brief appointment summary and ask the caller to confirm.`;
+      } else {
+        statePrompt += `\nCollected so far: ${collected}.\nStill need: ${missing.join(", ")}.\nAsk for the next missing field only.`;
+      }
     } else if (this.session.state === "CONFIRMING") {
       statePrompt += `\nRead back the full booking: ${formatAppointmentSummary(this.session.appointment)}.\nAsk the caller to confirm. If they confirm, you MUST call book_appointment.`;
+    } else if (this.session.state === "BOOKED") {
+      statePrompt += `\nThe appointment is confirmed. Say a warm, brief one-sentence goodbye only.`;
     }
     return statePrompt;
   }
@@ -118,62 +140,62 @@ export class CallHandler {
 
     const setupMsg = {
       setup: {
-        model: "models/gemini-2.0-flash-exp",
+        model: "models/gemini-3.1-flash-live-preview",
         generationConfig: {
           responseModalities: ["AUDIO"],
           speechConfig: {
-             voiceConfig: {
-                prebuiltVoiceConfig: {
-                   voiceName: "Aoede"
-                }
-             }
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: "Aoede"
+              }
+            }
           }
         },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
         systemInstruction: {
           parts: [{ text: fullSystemPrompt }]
         },
         tools: tools
       }
     };
-    this.geminiWs?.send(JSON.stringify(setupMsg));
-
-    const initMsg = {
-      clientContent: {
-        turns: [{ role: "user", parts: [{ text: "Hello! I just connected." }] }],
-        turnComplete: true
-      }
-    };
-    this.geminiWs?.send(JSON.stringify(initMsg));
+    const setupJson = JSON.stringify(setupMsg);
+    console.log("[Gemini Live] Sending setup:", setupJson.slice(0, 500));
+    this.geminiWs?.send(setupJson);
+    // Initial greeting is sent only after Gemini acknowledges the setup
+    // via a "setupComplete" event — see handleGeminiMessage.
   }
 
   public receiveAudio(pcm8kBuffer: Buffer) {
     if (this.isClosed || !this.geminiWs || this.geminiWs.readyState !== WebSocket.OPEN) return;
+    if (this.session.state === "BOOKED" || this.session.state === "FAILED") return;
 
-    if (!this.session.isSpeaking) {
-      // Upsample 8kHz to 16kHz
-      const pcm16kBuffer = Buffer.alloc(pcm8kBuffer.length * 2);
-      for (let i = 0; i < pcm8kBuffer.length / 2; i++) {
-        const sample = pcm8kBuffer.readInt16LE(i * 2);
-        pcm16kBuffer.writeInt16LE(sample, i * 4);
-        pcm16kBuffer.writeInt16LE(sample, i * 4 + 2);
-      }
+    if (this.session.isSpeaking) return;
 
-      const payload = {
-        realtimeInput: {
-          mediaChunks: [{
-            mimeType: "audio/pcm;rate=16000",
-            data: pcm16kBuffer.toString("base64")
-          }]
-        }
-      };
-      this.geminiWs.send(JSON.stringify(payload));
+    // Upsample 8kHz → 16kHz (nearest-neighbour duplication)
+    const pcm16kBuffer = Buffer.alloc(pcm8kBuffer.length * 2);
+    for (let i = 0; i < pcm8kBuffer.length / 2; i++) {
+      const sample = pcm8kBuffer.readInt16LE(i * 2);
+      pcm16kBuffer.writeInt16LE(sample, i * 4);
+      pcm16kBuffer.writeInt16LE(sample, i * 4 + 2);
     }
+
+    const payload = {
+      realtimeInput: {
+        audio: {
+          data: pcm16kBuffer.toString("base64"),
+          mimeType: "audio/pcm;rate=16000"
+        }
+      }
+    };
+    this.geminiWs.send(JSON.stringify(payload));
   }
 
   public handleBargeIn() {
     if (this.isClosed || !this.session.isSpeaking) return;
     this.session.interruptRequested = true;
     this.session.isSpeaking = false;
+    this.geminiAudioChunks = [];
     this.sendClearAudio();
 
     if (this.geminiWs && this.geminiWs.readyState === WebSocket.OPEN) {
@@ -192,21 +214,63 @@ export class CallHandler {
   }
 
   private async handleGeminiMessage(msg: any) {
+    // Gemini confirms the setup is complete — now it's safe to send the greeting
+    if (msg.setupComplete) {
+      console.log("[Gemini Live] Setup complete — sending greeting");
+      const initMsg = {
+        clientContent: {
+          turns: [{ role: "user", parts: [{ text: "[SYSTEM: Call just connected. Greet the caller warmly in one sentence.]" }] }],
+          turnComplete: true
+        }
+      };
+      this.geminiWs?.send(JSON.stringify(initMsg));
+    }
+
     if (msg.serverContent) {
+      // Live transcripts — log and persist to call log
+      if (msg.serverContent.inputTranscription?.text) {
+        const text: string = msg.serverContent.inputTranscription.text;
+        console.log(`[Caller] ${text}`);
+        this.callLog.addCallerLine(text);
+      }
+      if (msg.serverContent.outputTranscription?.text) {
+        const text: string = msg.serverContent.outputTranscription.text;
+        console.log(`[Agent]  ${text}`);
+        this.callLog.addAgentLine(text);
+      }
+
       if (msg.serverContent.modelTurn) {
         this.session.isSpeaking = true;
         this.session.interruptRequested = false;
-        
+
         const parts = msg.serverContent.modelTurn.parts;
         for (const part of parts) {
           if (part.inlineData && part.inlineData.data) {
-             const mulawBuffer = pcm24kToMulaw8k(part.inlineData.data);
-             await this.doPlayBuffer(mulawBuffer);
+            const mulawBuffer = pcm24kToMulaw8k(part.inlineData.data);
+            this.geminiAudioChunks.push(mulawBuffer);
           }
         }
       }
+
       if (msg.serverContent.turnComplete) {
+        let playedAudio = false;
+        if (this.geminiAudioChunks.length > 0) {
+          const combined = Buffer.concat(this.geminiAudioChunks);
+          this.geminiAudioChunks = [];
+          console.log(`[Audio] Playing buffered Gemini audio — ${combined.length} bytes mulaw`);
+          await this.doPlayBuffer(combined);
+          playedAudio = true;
+        }
         this.session.isSpeaking = false;
+        console.log("[Audio] Gemini turn complete — caller audio unblocked");
+
+        // Only hang up after a turn that actually had audio (i.e. the goodbye message).
+        // Skips the silent interrupt-acknowledgement turn that arrives right after tool calls.
+        if (this.pendingHangup && playedAudio) {
+          this.pendingHangup = false;
+          console.log("[State] Goodbye played — hanging up");
+          void hangUpCall(this.callSid).catch(console.error);
+        }
       }
     }
     
@@ -223,23 +287,25 @@ export class CallHandler {
           });
         }
         
-        const updateMsg = {
-           clientContent: {
-              turnComplete: true,
-              turns: [{
-                 role: "user",
-                 parts: [{ text: `[SYSTEM STATE UPDATE]\n${this.getDynamicStateInstruction()}` }]
-              }]
-           }
-        };
-        this.geminiWs?.send(JSON.stringify(updateMsg));
-
+        // toolResponse must be sent first — it closes the pending tool call turn
         const toolResponseMsg = {
           toolResponse: {
             functionResponses: responses
           }
         };
         this.geminiWs?.send(JSON.stringify(toolResponseMsg));
+
+        // Follow up with a state update so Gemini knows the current context
+        const updateMsg = {
+          clientContent: {
+            turns: [{
+              role: "user",
+              parts: [{ text: `[SYSTEM STATE UPDATE]\n${this.getDynamicStateInstruction()}` }]
+            }],
+            turnComplete: true
+          }
+        };
+        this.geminiWs?.send(JSON.stringify(updateMsg));
       }
     }
   }
@@ -268,6 +334,24 @@ export class CallHandler {
       }
     } else if (name === "book_appointment") {
       this.session.state = "BOOKED";
+      console.log("[State] → BOOKED — waiting for goodbye before hang-up");
+      this.pendingHangup = true;
+
+      // Send confirmation SMS
+      if (this.session.callerPhone && this.session.callerPhone !== "unknown") {
+        const appt = this.session.appointment;
+        const smsMsg = `Your appointment is confirmed! ${appt.name} on ${appt.date} at ${appt.time}${appt.reason ? ` for ${appt.reason}` : ""}.`;
+        void sendConfirmationSms({ phone_number: this.session.callerPhone, message: smsMsg }).catch(console.error);
+      }
+
+      // Safety fallback: if Gemini never delivers the goodbye, hang up after 15 s
+      setTimeout(() => {
+        if (this.pendingHangup) {
+          console.log("[State] Safety timer fired — hanging up");
+          this.pendingHangup = false;
+          void hangUpCall(this.callSid).catch(console.error);
+        }
+      }, 15_000);
     }
 
     return result;

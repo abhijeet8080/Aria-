@@ -110,6 +110,15 @@ export async function sendConfirmationSms(args: {
   }
 }
 
+export async function hangUpCall(callSid: string): Promise<void> {
+  try {
+    await twilioClient.calls(callSid).update({ status: "completed" });
+    console.log(`[Twilio] Call ${callSid} ended`);
+  } catch (err: unknown) {
+    console.error("[Twilio] Hang up error:", err instanceof Error ? err.message : String(err));
+  }
+}
+
 export async function executeTool(
   name: string,
   args: Record<string, unknown>

@@ -22,6 +22,7 @@ export interface CallSession {
   isSpeaking: boolean;        // true while audio chunks are being sent
   isBusy: boolean;            // true while Gemini/TTS fetch is in progress
   interruptRequested: boolean;
+  language: string;           // BCP-47 code e.g. "en-US", "hi-IN" — detected at runtime
 }
 
 export function createSession(
@@ -38,12 +39,14 @@ export function createSession(
     isSpeaking: false,
     isBusy: false,
     interruptRequested: false,
+    language: "en-US",
   };
 }
 
 export function missingFields(appt: AppointmentInfo): string[] {
   const missing: string[] = [];
   if (!appt.name) missing.push("name");
+  if (!appt.reason) missing.push("reason for visit");
   if (!appt.date) missing.push("date");
   if (!appt.time) missing.push("time");
   return missing;
